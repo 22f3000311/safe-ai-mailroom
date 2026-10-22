@@ -3,7 +3,10 @@ import re
 import json
 import base64
 import hashlib
-import sqlite3
+import math
+import asyncio
+import psycopg
+from psycopg.rows import dict_row
 from threading import Lock
 from contextlib import asynccontextmanager
 from typing import Any
@@ -15,13 +18,14 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from cryptography.exceptions import InvalidSignature
 
 PROFILE = "ga5-mailroom-action-gate/v2"
-DB_PATH = os.path.expanduser(os.getenv("MAILROOM_DB_PATH", "~/mailroom-agent-data/mailroom_v2.db"))
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
 MAX_BODY_BYTES = 2 * 1024 * 1024
 MAX_RESPONSE_BYTES = 512 * 1024
 MAX_MODEL_OUTPUT_TOKENS = 14000
 CALL_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{12,128}$")
 REQUEST_LOCK = Lock()
+ASYNC_REQUEST_LOCK = asyncio.Lock()
 ACTIONS = {
     "create_draft", "update_internal_record", "send_approved_notice",
     "request_confirmation", "quarantine_item", "no_action"
@@ -37,12 +41,10 @@ def sha256_json(value: Any) -> str:
 
 
 def db_connect():
-    os.makedirs(os.path.dirname(os.path.abspath(os.path.expanduser(DB_PATH))), exist_ok=True)
-    conn = sqlite3.connect(os.path.expanduser(DB_PATH), timeout=15)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA foreign_keys=ON")
-    return conn
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL environment variable is required")
+    # dict_row preserves the row["column_name"] access used throughout the app.
+    return psycopg.connect(DATABASE_URL, row_factory=dict_row, connect_timeout=10)
 
 
 def initialize_database():
@@ -108,6 +110,8 @@ def validate_propose(data):
     required = {"profile", "operation", "evaluationId", "receiptVerifier", "corpus", "allowedActions", "dossiers"}
     if set(data) != required:
         fail(422, "Invalid propose request fields")
+    if data.get("profile") != PROFILE or data.get("operation") != "propose":
+        fail(422, "Invalid propose profile or operation")
     require_string(data, "evaluationId", "request")
 
     verifier = data["receiptVerifier"]
@@ -128,7 +132,7 @@ def validate_propose(data):
         fail(422, "Invalid Ed25519 public key encoding")
 
     corpus = data["corpus"]
-    if not isinstance(corpus, dict):
+    if not isinstance(corpus, dict) or set(corpus) != {"coreId", "auditId", "stableCount", "freshCount"}:
         fail(422, "Invalid corpus")
     for field in ("coreId", "auditId"):
         require_string(corpus, field, "corpus")
@@ -147,6 +151,8 @@ def validate_propose(data):
     for dossier in dossiers:
         if not isinstance(dossier, dict):
             fail(422, "Invalid dossier")
+        if set(dossier) != {"dossierId", "partition", "receivedAt", "mailbox", "objective", "sources"}:
+            fail(422, "Invalid dossier fields")
         for field in ("dossierId", "partition", "receivedAt", "mailbox", "objective"):
             require_string(dossier, field, "dossier")
         did = dossier["dossierId"]
@@ -162,6 +168,8 @@ def validate_propose(data):
         for source in sources:
             if not isinstance(source, dict):
                 fail(422, "Invalid source")
+            if set(source) != {"sourceId", "kind", "provenance", "title", "lines"}:
+                fail(422, "Invalid source fields")
             for field in ("sourceId", "kind", "provenance", "title"):
                 require_string(source, field, "source")
             if source["sourceId"] in seen_sources:
@@ -176,6 +184,8 @@ def validate_propose(data):
                     fail(422, "Invalid line")
                 line_id = require_string(line, "lineId", "line")
                 require_string(line, "text", "line", nonempty=False)
+                if set(line) != {"lineId", "text"}:
+                    fail(422, "Invalid line fields")
                 if line_id in seen_lines:
                     fail(422, "Duplicate lineId")
                 seen_lines.add(line_id)
@@ -232,15 +242,23 @@ def validate_proposal(proposal, dossier, allowed_actions):
         raise ValueError("Invalid payload fields")
     if any(not isinstance(v, (str, int, float, bool)) or v is None for v in payload.values()):
         raise ValueError("Payload values must be scalar and non-null")
+    if any(isinstance(v, str) and not v.strip() for v in payload.values()):
+        raise ValueError("Payload strings must be non-empty")
+    if any(isinstance(v, float) and not math.isfinite(v) for v in payload.values()):
+        raise ValueError("Payload numbers must be finite")
     if action == "create_draft":
         if payload.get("template") != "order_status":
             raise ValueError("Invalid create_draft template")
         if target.get("id") != "mailbox:" + dossier["mailbox"]:
             raise ValueError("Draft target must match dossier mailbox")
-    if action == "update_internal_record" and payload.get("field") != "delivery_window":
-        raise ValueError("Invalid update field")
-    if action == "send_approved_notice" and payload.get("template") != "approved_delivery_notice":
-        raise ValueError("Invalid notice template")
+    if action == "update_internal_record":
+        if payload.get("field") != "delivery_window":
+            raise ValueError("Invalid update field")
+        if not isinstance(payload.get("value"), str) or not isinstance(payload.get("sourceEventId"), str):
+            raise ValueError("Invalid update values")
+    if action == "send_approved_notice":
+        if payload.get("template") != "approved_delivery_notice":
+            raise ValueError("Invalid notice template")
     if action == "request_confirmation" and payload.get("questionCode") != "VERIFY_REQUEST":
         raise ValueError("Invalid confirmation code")
     if action == "quarantine_item":
@@ -357,7 +375,7 @@ def handle_propose(data):
     request_fingerprint = sha256_json({k: v for k, v in data.items() if k != "operation"})
 
     with db_connect() as conn:
-        existing = conn.execute("SELECT * FROM evaluations WHERE evaluation_id=?", (evaluation_id,)).fetchone()
+        existing = conn.execute("SELECT * FROM evaluations WHERE evaluation_id=%s", (evaluation_id,)).fetchone()
         if existing:
             if existing["request_fingerprint"] != request_fingerprint:
                 fail(409, "Evaluation ID reused with different content")
@@ -371,7 +389,7 @@ def handle_propose(data):
         fingerprint = sha256_json(dossier)
         cache_keys.append((dossier["dossierId"], fingerprint))
         with db_connect() as conn:
-            row = conn.execute("SELECT proposal_json FROM proposal_cache WHERE dossier_id=? AND content_fingerprint=?", (dossier["dossierId"], fingerprint)).fetchone()
+            row = conn.execute("SELECT proposal_json FROM proposal_cache WHERE dossier_id=%s AND content_fingerprint=%s", (dossier["dossierId"], fingerprint)).fetchone()
         if row:
             cached = json.loads(row["proposal_json"])
             # Cached decisions are rechecked against current allowed actions and schema.
@@ -400,8 +418,9 @@ def handle_propose(data):
                     raise HTTPException(status_code=503, detail="AI returned an invalid proposal; retry later") from exc2
             proposals[position] = normalized
             with db_connect() as conn:
-                conn.execute("""INSERT OR REPLACE INTO proposal_cache
-                    (dossier_id, content_fingerprint, proposal_json) VALUES (?, ?, ?)""",
+                conn.execute("""INSERT INTO proposal_cache
+                    (dossier_id, content_fingerprint, proposal_json) VALUES (%s, %s, %s)
+                    ON CONFLICT (dossier_id, content_fingerprint) DO UPDATE SET proposal_json = EXCLUDED.proposal_json""",
                     (dossier["dossierId"], fingerprint, canonical_json(normalized)))
 
     response = {
@@ -417,13 +436,12 @@ def handle_propose(data):
 
     with db_connect() as conn:
         # Recheck under write transaction to handle concurrent duplicate requests.
-        conn.execute("BEGIN IMMEDIATE")
-        existing = conn.execute("SELECT * FROM evaluations WHERE evaluation_id=?", (evaluation_id,)).fetchone()
+        existing = conn.execute("SELECT * FROM evaluations WHERE evaluation_id=%s", (evaluation_id,)).fetchone()
         if existing:
             if existing["request_fingerprint"] != request_fingerprint:
                 fail(409, "Evaluation ID reused with different content")
             return json.loads(existing["response_json"])
-        conn.execute("INSERT INTO evaluations (evaluation_id,input_digest,request_fingerprint,receipt_verifier,response_json) VALUES (?,?,?,?,?)",
+        conn.execute("INSERT INTO evaluations (evaluation_id,input_digest,request_fingerprint,receipt_verifier,response_json) VALUES (%s,%s,%s,%s,%s)",
                      (evaluation_id, input_digest, request_fingerprint, verifier_json, encoded))
     return response
 
@@ -462,12 +480,12 @@ def handle_commit(data):
     evaluation_id, input_digest = data["evaluationId"], data["inputDigest"]
     request_fingerprint = sha256_json(data)
     with db_connect() as conn:
-        evaluation = conn.execute("SELECT * FROM evaluations WHERE evaluation_id=?", (evaluation_id,)).fetchone()
+        evaluation = conn.execute("SELECT * FROM evaluations WHERE evaluation_id=%s", (evaluation_id,)).fetchone()
         if not evaluation:
             fail(404, "Unknown evaluation")
         if evaluation["input_digest"] != input_digest:
             fail(409, "inputDigest does not match evaluation")
-        prior = conn.execute("SELECT * FROM commits WHERE evaluation_id=?", (evaluation_id,)).fetchone()
+        prior = conn.execute("SELECT * FROM commits WHERE evaluation_id=%s", (evaluation_id,)).fetchone()
         if prior:
             if prior["request_fingerprint"] != request_fingerprint:
                 fail(409, "Evaluation already committed with different receipts")
@@ -518,16 +536,15 @@ def handle_commit(data):
         fail(413, "Successful response exceeds 512 KiB")
 
     with db_connect() as conn:
-        conn.execute("BEGIN IMMEDIATE")
-        existing = conn.execute("SELECT * FROM commits WHERE evaluation_id=?", (evaluation_id,)).fetchone()
+        existing = conn.execute("SELECT * FROM commits WHERE evaluation_id=%s", (evaluation_id,)).fetchone()
         if existing:
             if existing["request_fingerprint"] != request_fingerprint:
                 fail(409, "Evaluation already committed with different receipts")
             return json.loads(existing["response_json"])
-        conn.execute("INSERT INTO commits (evaluation_id,input_digest,request_fingerprint,response_json) VALUES (?,?,?,?)",
+        conn.execute("INSERT INTO commits (evaluation_id,input_digest,request_fingerprint,response_json) VALUES (%s,%s,%s,%s)",
                      (evaluation_id, input_digest, request_fingerprint, encoded))
         for receipt in data["receipts"]:
-            conn.execute("INSERT INTO receipts (evaluation_id,receipt_id,dossier_id,receipt_json) VALUES (?,?,?,?)",
+            conn.execute("INSERT INTO receipts (evaluation_id,receipt_id,dossier_id,receipt_json) VALUES (%s,%s,%s,%s)",
                          (evaluation_id, receipt["receiptId"], receipt["dossierId"], canonical_json(receipt)))
     return response
 
@@ -547,10 +564,10 @@ async def handle_request(request: Request):
         fail(422, "Unsupported profile")
     operation = data.get("operation")
     if operation == "propose":
-        with REQUEST_LOCK:
+        async with ASYNC_REQUEST_LOCK:
             result = handle_propose(data)
     elif operation == "commit":
-        with REQUEST_LOCK:
+        async with ASYNC_REQUEST_LOCK:
             result = handle_commit(data)
     else:
         fail(422, "Operation must be propose or commit")
