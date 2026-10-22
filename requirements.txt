@@ -2,3 +2,4 @@ fastapi
 uvicorn[standard]
 cryptography
 openai
+psycopg[binary]
