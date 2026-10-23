@@ -322,6 +322,8 @@ Do not add target or payload fields. Use exact strings found in dossier when fil
         raise
     except Exception as exc:
         # Avoid echoing dossier content or credentials in errors.
+        # raise HTTPException(status_code=503, detail="AI proposal generation failed; retry later") from exc
+        print(f"AI provider error: {type(exc).__name__}: {exc}", flush=True)
         raise HTTPException(status_code=503, detail="AI proposal generation failed; retry later") from exc
 
 
