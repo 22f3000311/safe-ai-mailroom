@@ -22,9 +22,9 @@ DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
 MAX_BODY_BYTES = 2 * 1024 * 1024
 MAX_RESPONSE_BYTES = 512 * 1024
-MAX_MODEL_OUTPUT_TOKENS = 3000
+MAX_MODEL_OUTPUT_TOKENS = 1200
 # Keep each provider request small enough for Groq's request/token limits.
-AI_BATCH_SIZE = 2
+AI_BATCH_SIZE = 1
 CALL_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{12,128}$")
 REQUEST_LOCK = Lock()
 ASYNC_REQUEST_LOCK = asyncio.Lock()
