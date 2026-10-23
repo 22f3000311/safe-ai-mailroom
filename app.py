@@ -310,12 +310,24 @@ Do not add target or payload fields. Use exact strings found in dossier when fil
         response = client.chat.completions.create(
             model=MODEL,
             messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": canonical_json(user_content)}],
-            response_format={"type": "json_object"},
             temperature=0,
             max_completion_tokens=MAX_MODEL_OUTPUT_TOKENS,
         )
         content = response.choices[0].message.content
-        parsed = json.loads(content)
+        if not isinstance(content, str) or not content.strip():
+            raise ValueError("Model returned empty content")
+        # Some Groq model responses fail provider-side JSON mode validation.
+        # Parse the model's JSON-only response ourselves instead.
+        content = content.strip()
+        if content.startswith("```"):
+            content = re.sub(r"^```(?:json)?\s*|\s*```$", "", content, flags=re.IGNORECASE).strip()
+        try:
+            parsed = json.loads(content)
+        except json.JSONDecodeError:
+            start, end = content.find("{"), content.rfind("}")
+            if start < 0 or end <= start:
+                raise
+            parsed = json.loads(content[start:end + 1])
         proposals = parsed.get("proposals") if isinstance(parsed, dict) else None
         if not isinstance(proposals, list) or len(proposals) != len(dossiers):
             raise ValueError("Model returned wrong number of proposals")
