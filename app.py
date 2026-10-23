@@ -314,7 +314,6 @@ Do not add target or payload fields. Use exact strings found in dossier when fil
             temperature=0,
             max_completion_tokens=MAX_MODEL_OUTPUT_TOKENS,
             reasoning_effort="low",
-            include_reasoning=False,
         )
         choice = response.choices[0]
         message = choice.message
