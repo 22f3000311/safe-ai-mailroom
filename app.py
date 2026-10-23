@@ -22,9 +22,9 @@ DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
 MAX_BODY_BYTES = 2 * 1024 * 1024
 MAX_RESPONSE_BYTES = 512 * 1024
-MAX_MODEL_OUTPUT_TOKENS = 1200
+MAX_MODEL_OUTPUT_TOKENS = 3000
 # Keep each provider request small enough for Groq's request/token limits.
-AI_BATCH_SIZE = 3
+AI_BATCH_SIZE = 2
 CALL_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{12,128}$")
 REQUEST_LOCK = Lock()
 ASYNC_REQUEST_LOCK = asyncio.Lock()
@@ -310,24 +310,30 @@ Do not add target or payload fields. Use exact strings found in dossier when fil
         response = client.chat.completions.create(
             model=MODEL,
             messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": canonical_json(user_content)}],
+            response_format={"type": "json_object"},
             temperature=0,
             max_completion_tokens=MAX_MODEL_OUTPUT_TOKENS,
         )
-        content = response.choices[0].message.content
+        choice = response.choices[0]
+        message = choice.message
+        content = message.content
         if not isinstance(content, str) or not content.strip():
+            # gpt-oss can spend its completion budget on reasoning and return no
+            # user-facing content. Log only response metadata, not dossier text.
+            reasoning = getattr(message, "reasoning", None)
+            print(
+                "Empty model content; finish_reason={!r}, reasoning_present={!r}, usage={!r}".format(
+                    getattr(choice, "finish_reason", None),
+                    bool(reasoning),
+                    getattr(response, "usage", None),
+                ),
+                flush=True,
+            )
             raise ValueError("Model returned empty content")
-        # Some Groq model responses fail provider-side JSON mode validation.
-        # Parse the model's JSON-only response ourselves instead.
         content = content.strip()
         if content.startswith("```"):
             content = re.sub(r"^```(?:json)?\s*|\s*```$", "", content, flags=re.IGNORECASE).strip()
-        try:
-            parsed = json.loads(content)
-        except json.JSONDecodeError:
-            start, end = content.find("{"), content.rfind("}")
-            if start < 0 or end <= start:
-                raise
-            parsed = json.loads(content[start:end + 1])
+        parsed = json.loads(content)
         proposals = parsed.get("proposals") if isinstance(parsed, dict) else None
         if not isinstance(proposals, list) or len(proposals) != len(dossiers):
             raise ValueError("Model returned wrong number of proposals")
